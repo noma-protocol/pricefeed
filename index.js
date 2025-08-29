@@ -398,67 +398,6 @@ const filterOHLCByTimeRange = (ohlcData, fromTimestamp, toTimestamp) => {
   });
 };
 
-// Constants for external API
-const API_BASE_URL = "https://pricefeed.noma.money";
-
-// Fetch token price stats including 24h change
-const fetchTokenPriceStats = async () => {
-  try {
-    const response = await fetch(`${API_BASE_URL}/api/price/stats`);
-    if (!response.ok) {
-      throw new Error(`API error: ${response.status}`);
-    }
-    
-    const data = await response.json();
-    return data;
-  } catch (error) {
-    console.error("Error fetching price stats:", error);
-    // Try alternative endpoint
-    try {
-      const response = await fetch(`${API_BASE_URL}/api/stats`);
-      if (!response.ok) {
-        throw new Error(`API error: ${response.status}`);
-      }
-      const data = await response.json();
-      return data;
-    } catch (altError) {
-      console.error("Error fetching alternative price stats:", altError);
-      return null;
-    }
-  }
-};
-
-// Helper function to get time parameters for API
-const getTimeParams = (timeframe, granularity) => {
-  const now = Date.now();
-  let fromTimestamp;
-  
-  switch (timeframe) {
-    case "15m":
-      fromTimestamp = now - (15 * 60 * 1000);
-      break;
-    case "1h":
-      fromTimestamp = now - (60 * 60 * 1000);
-      break;
-    case "24h":
-      fromTimestamp = now - (24 * 60 * 60 * 1000);
-      break;
-    case "1w":
-      fromTimestamp = now - (7 * 24 * 60 * 60 * 1000);
-      break;
-    case "1M":
-      fromTimestamp = now - (30 * 24 * 60 * 60 * 1000);
-      break;
-    default:
-      fromTimestamp = now - (24 * 60 * 60 * 1000);
-  }
-  
-  return {
-    from_timestamp: fromTimestamp,
-    to_timestamp: now,
-    interval: granularity
-  };
-};
 
 // API Endpoints
 app.get("/api/price", (req, res) => {
@@ -913,15 +852,29 @@ app.get("/api/stats", (req, res) => {
   // First, try using OHLC data if available
   if (intervalConfig.ohlcKey && priceData.ohlc[intervalConfig.ohlcKey]) {
     const ohlcData = priceData.ohlc[intervalConfig.ohlcKey];
-    // Find the candle closest to our cutoff time
-    const relevantCandles = ohlcData.filter(candle => 
-      candle.timestamp <= cutoffTime + intervalConfig.ms && 
-      candle.timestamp >= cutoffTime - intervalConfig.ms
-    );
+    // Find the candle that contains our cutoff time
+    let closestCandle = null;
+    let closestTimeDiff = Infinity;
     
-    if (relevantCandles.length > 0) {
-      // Use the open price of the oldest relevant candle
-      startPrice = relevantCandles[0].open;
+    for (const candle of ohlcData) {
+      // Check if the cutoff time falls within this candle's time range
+      if (cutoffTime >= candle.timestamp && cutoffTime < candle.timestamp + intervalConfig.ms) {
+        // Use the open price of this candle as it represents the price at the start of the period
+        startPrice = candle.open;
+        break;
+      }
+      
+      // Also track the closest candle in case we don't find an exact match
+      const timeDiff = Math.abs(candle.timestamp - cutoffTime);
+      if (timeDiff < closestTimeDiff) {
+        closestTimeDiff = timeDiff;
+        closestCandle = candle;
+      }
+    }
+    
+    // If we didn't find an exact match, use the closest candle if it's reasonably close
+    if (!startPrice && closestCandle && closestTimeDiff <= intervalConfig.ms) {
+      startPrice = closestCandle.close;
     }
   }
   
