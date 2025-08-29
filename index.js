@@ -1,4 +1,4 @@
-import { ethers, Contract, JsonRpcProvider } from "ethers";
+import { ethers, Contract, JsonRpcProvider, WebSocketProvider } from "ethers";
 import express from "express";
 import cors from "cors";
 import fs from "fs-extra";
@@ -6,9 +6,17 @@ import IUniswapV3PoolABI from "./artifacts/IUniswapV3PoolAbi.json" assert { type
 
 // Configuration
 const providerUrl = "https://rpc.ankr.com/monad_testnet";
+const wsProviderUrl = "wss://monad-testnet.rpc.ankr.com/ws"; // WebSocket URL for events (may not be available)
 const poolAddress = "0x222705B830a38654B46340A99F5F3f1718A5C95d";
 const dataFilePath = "./priceData.json";
 const PORT = 3001;
+const USE_WEBSOCKET = false; // Disable WebSocket for now as Monad testnet may not support it
+
+// Global providers
+let provider;
+let wsProvider;
+let poolContract;
+let wsPoolContract;
 
 // Initialize price data storage
 const priceData = {
@@ -26,6 +34,13 @@ const priceData = {
     "24h": [],
     "1w": [],
     "1M": []
+  },
+  volume: {
+    "24h": 0,
+    "7d": 0,
+    "30d": 0,
+    total: 0,
+    lastReset: Date.now()
   }
 };
 
@@ -170,6 +185,39 @@ const initializeDataFile = async () => {
       if (!priceData.ohlc["1w"]) priceData.ohlc["1w"] = [];
       if (!priceData.ohlc["1M"]) priceData.ohlc["1M"] = [];
       
+      // Initialize volume tracking if not present
+      if (!priceData.volume) {
+        priceData.volume = {
+          "24h": 0,
+          "7d": 0,
+          "30d": 0,
+          total: 0,
+          lastReset: Date.now()
+        };
+      }
+      
+      // Load volume history if saved
+      if (data.volumeHistory) {
+        volumeHistory.push(...data.volumeHistory);
+        // Recalculate volumes based on history
+        const now = Date.now();
+        const dayAgo = now - 24 * 60 * 60 * 1000;
+        const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
+        const monthAgo = now - 30 * 24 * 60 * 60 * 1000;
+        
+        priceData.volume["24h"] = volumeHistory
+          .filter(v => v.timestamp >= dayAgo)
+          .reduce((sum, v) => sum + v.volume, 0);
+          
+        priceData.volume["7d"] = volumeHistory
+          .filter(v => v.timestamp >= weekAgo)
+          .reduce((sum, v) => sum + v.volume, 0);
+          
+        priceData.volume["30d"] = volumeHistory
+          .filter(v => v.timestamp >= monthAgo)
+          .reduce((sum, v) => sum + v.volume, 0);
+      }
+      
       // Backfill historical OHLC data from price history
       backfillHistoricalOHLC();
       
@@ -189,8 +237,9 @@ const initializeDataFile = async () => {
 // Fetch the latest price from Uniswap pool
 const fetchLatestPrice = async () => {
   try {
-    const provider = new JsonRpcProvider(providerUrl);
-    const poolContract = new Contract(poolAddress, IUniswapV3PoolABI.abi, provider);
+    if (!poolContract) {
+      return null;
+    }
     const slot0 = await poolContract.slot0();
     const sqrtPriceX96 = slot0.sqrtPriceX96;
     const price = (Number(sqrtPriceX96) ** 2) / 2 ** 192;
@@ -198,6 +247,122 @@ const fetchLatestPrice = async () => {
   } catch (error) { 
     console.error("Error fetching price:", error);
     return null;
+  }
+};
+
+// Track last processed block to avoid duplicates
+let lastProcessedBlock = 0;
+
+// Query past events periodically
+const queryPastEvents = async () => {
+  try {
+    if (!poolContract) return;
+    
+    const currentBlock = await provider.getBlockNumber();
+    
+    // First run - start from current block
+    if (lastProcessedBlock === 0) {
+      lastProcessedBlock = currentBlock - 100; // Start from 100 blocks ago
+    }
+    
+    // Don't query if no new blocks
+    if (currentBlock <= lastProcessedBlock) return;
+    
+    console.log(`Querying events from block ${lastProcessedBlock + 1} to ${currentBlock}`);
+    
+    // Create event filter for Swap events
+    const filter = poolContract.filters.Swap();
+    
+    // Query events in chunks to avoid timeouts
+    const blockRange = currentBlock - lastProcessedBlock;
+    const chunkSize = 100;
+    
+    for (let i = lastProcessedBlock + 1; i <= currentBlock; i += chunkSize) {
+      const fromBlock = i;
+      const toBlock = Math.min(i + chunkSize - 1, currentBlock);
+      
+      try {
+        const events = await poolContract.queryFilter(filter, fromBlock, toBlock);
+        
+        for (const event of events) {
+          const { sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick } = event.args;
+          
+          // Calculate volume (assuming token1 is USD - you'd need to verify this)
+          const volumeUSD = calculateSwapVolume(amount0, amount1, false);
+          updateVolume(volumeUSD);
+          
+          console.log(`Processed swap event: Volume $${volumeUSD.toFixed(2)}`);
+        }
+      } catch (error) {
+        console.error(`Error querying events for blocks ${fromBlock}-${toBlock}:`, error.message);
+      }
+    }
+    
+    lastProcessedBlock = currentBlock;
+  } catch (error) {
+    console.error("Error querying past events:", error);
+  }
+};
+
+// Set up event listeners for swap events
+const setupEventListeners = async () => {
+  try {
+    if (USE_WEBSOCKET) {
+      // Try WebSocket connection if enabled
+      try {
+        wsProvider = new WebSocketProvider(wsProviderUrl);
+        wsPoolContract = new Contract(poolAddress, IUniswapV3PoolABI.abi, wsProvider);
+        
+        // Get token addresses to determine which is USD
+        const token0 = await wsPoolContract.token0();
+        const token1 = await wsPoolContract.token1();
+        
+        console.log("Token0:", token0);
+        console.log("Token1:", token1);
+        
+        // Listen to Swap events
+        wsPoolContract.on("Swap", (sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick, event) => {
+          console.log("Swap event detected!");
+          
+          // Calculate volume
+          const volumeUSD = calculateSwapVolume(amount0, amount1, false);
+          updateVolume(volumeUSD);
+          
+          // Update price from the event
+          const price = (Number(sqrtPriceX96) ** 2) / 2 ** 192;
+          const now = Date.now();
+          
+          priceData.latestPrice = price;
+          priceData.lastUpdated = now;
+          
+          // Add to history
+          priceData.history.push({
+            price,
+            timestamp: now
+          });
+          
+          // Update OHLC data
+          updateOHLCData(price, now);
+          
+          console.log(`Swap: Price: ${price}, Volume: $${volumeUSD.toFixed(2)}, Total Volume (24h): $${priceData.volume["24h"].toFixed(2)}`);
+        });
+        
+        console.log("WebSocket event listeners set up successfully");
+      } catch (wsError) {
+        console.error("WebSocket connection failed:", wsError.message);
+        console.log("Will use periodic event querying instead");
+      }
+    } else {
+      console.log("WebSocket disabled, using periodic event querying");
+    }
+    
+    // Set up periodic event querying (runs whether WebSocket works or not)
+    setInterval(queryPastEvents, 10000); // Query every 10 seconds
+    
+    // Initial query
+    await queryPastEvents();
+  } catch (error) {
+    console.error("Error setting up event listeners:", error);
   }
 };
 
@@ -270,7 +435,12 @@ const cleanupOldData = () => {
 // Save price data to file
 const saveDataToFile = async () => {
   try {
-    await fs.writeJson(dataFilePath, priceData);
+    // Include volume history in saved data (limit to last 1000 entries)
+    const dataToSave = {
+      ...priceData,
+      volumeHistory: volumeHistory.slice(-1000)
+    };
+    await fs.writeJson(dataFilePath, dataToSave);
   } catch (error) {
     console.error("Error saving data to file:", error);
   }
@@ -339,6 +509,63 @@ const updateOHLCData = (price, timestamp) => {
   });
 };
 
+// Track individual swaps for accurate volume calculation
+const volumeHistory = [];
+
+// Update volume tracking from actual swap events
+const updateVolume = (volumeInUSD) => {
+  const now = Date.now();
+  
+  // Add to volume history
+  volumeHistory.push({
+    volume: volumeInUSD,
+    timestamp: now
+  });
+  
+  // Add to total volume
+  priceData.volume.total += volumeInUSD;
+  
+  // Calculate volume for each period based on actual history
+  const dayAgo = now - 24 * 60 * 60 * 1000;
+  const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
+  const monthAgo = now - 30 * 24 * 60 * 60 * 1000;
+  
+  // Recalculate volumes based on history
+  priceData.volume["24h"] = volumeHistory
+    .filter(v => v.timestamp >= dayAgo)
+    .reduce((sum, v) => sum + v.volume, 0);
+    
+  priceData.volume["7d"] = volumeHistory
+    .filter(v => v.timestamp >= weekAgo)
+    .reduce((sum, v) => sum + v.volume, 0);
+    
+  priceData.volume["30d"] = volumeHistory
+    .filter(v => v.timestamp >= monthAgo)
+    .reduce((sum, v) => sum + v.volume, 0);
+  
+  // Clean up old volume history (keep 30 days)
+  const cutoffTime = monthAgo;
+  while (volumeHistory.length > 0 && volumeHistory[0].timestamp < cutoffTime) {
+    volumeHistory.shift();
+  }
+};
+
+// Calculate USD volume from swap amounts
+const calculateSwapVolume = (amount0, amount1, token0IsUSD) => {
+  // For simplicity, we'll assume one token is USD-based
+  // In production, you'd need to fetch both token prices
+  const amount0Num = Math.abs(Number(amount0));
+  const amount1Num = Math.abs(Number(amount1));
+  
+  if (token0IsUSD) {
+    // Token0 is the USD token, use amount0 directly
+    return amount0Num / 1e18; // Assuming 18 decimals
+  } else {
+    // Token1 is the USD token, use amount1 directly
+    return amount1Num / 1e18; // Assuming 18 decimals
+  }
+};
+
 // Main price update function
 const updatePrice = async () => {
   const price = await fetchLatestPrice();
@@ -356,7 +583,7 @@ const updatePrice = async () => {
 
     // Update OHLC data
     updateOHLCData(price, now);
-
+    
     // Clean up old data
     cleanupOldData();
 
@@ -800,6 +1027,14 @@ app.get("/api/price/intervals/all", (req, res) => {
   });
 });
 
+// Volume endpoint to get volume data
+app.get("/api/volume", (req, res) => {
+  res.json({
+    volume: priceData.volume,
+    lastUpdated: priceData.lastUpdated
+  });
+});
+
 // Stats endpoint to calculate price percentage changes
 app.get("/api/stats", (req, res) => {
   const { interval } = req.query;
@@ -912,6 +1147,20 @@ app.get("/api/stats", (req, res) => {
   const priceChange = currentPrice - startPrice;
   const percentageChange = (priceChange / startPrice) * 100;
   
+  // Get appropriate volume based on interval
+  let volumeForInterval = 0;
+  if (interval === "24h" || interval === "1d") {
+    volumeForInterval = priceData.volume["24h"];
+  } else if (interval === "7d") {
+    volumeForInterval = priceData.volume["7d"];
+  } else if (interval === "30d") {
+    volumeForInterval = priceData.volume["30d"];
+  } else {
+    // For shorter intervals, estimate based on 24h volume
+    const hoursInInterval = intervalConfig.ms / (60 * 60 * 1000);
+    volumeForInterval = (priceData.volume["24h"] / 24) * hoursInInterval;
+  }
+  
   res.json({
     interval: interval,
     currentPrice: currentPrice,
@@ -919,6 +1168,13 @@ app.get("/api/stats", (req, res) => {
     priceChange: priceChange,
     percentageChange: percentageChange,
     percentageChangeFormatted: `${percentageChange >= 0 ? '+' : ''}${percentageChange.toFixed(2)}%`,
+    volume: {
+      interval: volumeForInterval,
+      "24h": priceData.volume["24h"],
+      "7d": priceData.volume["7d"],
+      "30d": priceData.volume["30d"],
+      total: priceData.volume.total
+    },
     timestamp: now,
     lastUpdated: priceData.lastUpdated
   });
@@ -929,8 +1185,15 @@ const init = async () => {
   // Initialize data file
   await initializeDataFile();
   
-  // Start price update interval
-  setInterval(updatePrice, 1000);
+  // Set up providers
+  provider = new JsonRpcProvider(providerUrl);
+  poolContract = new Contract(poolAddress, IUniswapV3PoolABI.abi, provider);
+  
+  // Set up event listeners for real-time volume tracking
+  await setupEventListeners();
+  
+  // Start price update interval (still useful for regular price updates if events are missed)
+  setInterval(updatePrice, 5000); // Reduced frequency since we also get updates from events
   
   // Start API server
   app.listen(PORT, () => {
