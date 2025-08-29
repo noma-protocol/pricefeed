@@ -398,12 +398,92 @@ const filterOHLCByTimeRange = (ohlcData, fromTimestamp, toTimestamp) => {
   });
 };
 
+// Constants for external API
+const API_BASE_URL = "https://pricefeed.noma.money";
+
+// Fetch token price stats including 24h change
+const fetchTokenPriceStats = async () => {
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/price/stats`);
+    if (!response.ok) {
+      throw new Error(`API error: ${response.status}`);
+    }
+    
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    console.error("Error fetching price stats:", error);
+    // Try alternative endpoint
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/stats`);
+      if (!response.ok) {
+        throw new Error(`API error: ${response.status}`);
+      }
+      const data = await response.json();
+      return data;
+    } catch (altError) {
+      console.error("Error fetching alternative price stats:", altError);
+      return null;
+    }
+  }
+};
+
+// Helper function to get time parameters for API
+const getTimeParams = (timeframe, granularity) => {
+  const now = Date.now();
+  let fromTimestamp;
+  
+  switch (timeframe) {
+    case "15m":
+      fromTimestamp = now - (15 * 60 * 1000);
+      break;
+    case "1h":
+      fromTimestamp = now - (60 * 60 * 1000);
+      break;
+    case "24h":
+      fromTimestamp = now - (24 * 60 * 60 * 1000);
+      break;
+    case "1w":
+      fromTimestamp = now - (7 * 24 * 60 * 60 * 1000);
+      break;
+    case "1M":
+      fromTimestamp = now - (30 * 24 * 60 * 60 * 1000);
+      break;
+    default:
+      fromTimestamp = now - (24 * 60 * 60 * 1000);
+  }
+  
+  return {
+    from_timestamp: fromTimestamp,
+    to_timestamp: now,
+    interval: granularity
+  };
+};
+
 // API Endpoints
 app.get("/api/price", (req, res) => {
   res.json({
     latest: priceData.latestPrice,
     lastUpdated: priceData.lastUpdated
   });
+});
+
+// Test endpoint for fetchTokenPriceStats
+app.get("/api/test/price-stats", async (req, res) => {
+  try {
+    const stats = await fetchTokenPriceStats();
+    res.json({
+      success: true,
+      data: stats,
+      timestamp: Date.now()
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: Date.now()
+    });
+  }
 });
 
 app.get("/api/price/latest", (req, res) => {
@@ -777,6 +857,116 @@ app.get("/api/price/intervals/all", (req, res) => {
 
   res.json({
     intervals: result,
+    lastUpdated: priceData.lastUpdated
+  });
+});
+
+// Stats endpoint to calculate price percentage changes
+app.get("/api/stats", (req, res) => {
+  const { interval } = req.query;
+  
+  if (!interval) {
+    return res.status(400).json({
+      error: "Missing required parameter: interval",
+      validIntervals: ["1m", "5m", "15m", "30m", "1h", "6h", "12h", "24h", "7d", "14d", "30d"]
+    });
+  }
+  
+  // Map common interval formats
+  const intervalMap = {
+    "1m": { ms: 1 * 60 * 1000, ohlcKey: "1m" },
+    "5m": { ms: 5 * 60 * 1000, ohlcKey: "5m" },
+    "15m": { ms: 15 * 60 * 1000, ohlcKey: "15m" },
+    "30m": { ms: 30 * 60 * 1000, ohlcKey: "30m" },
+    "1h": { ms: 60 * 60 * 1000, ohlcKey: "1h" },
+    "6h": { ms: 6 * 60 * 60 * 1000, ohlcKey: "6h" },
+    "12h": { ms: 12 * 60 * 60 * 1000, ohlcKey: "12h" },
+    "24h": { ms: 24 * 60 * 60 * 1000, ohlcKey: "24h" },
+    "7d": { ms: 7 * 24 * 60 * 60 * 1000, ohlcKey: "1w" },
+    "14d": { ms: 14 * 24 * 60 * 60 * 1000, ohlcKey: null },
+    "30d": { ms: 30 * 24 * 60 * 60 * 1000, ohlcKey: "1M" }
+  };
+  
+  const intervalConfig = intervalMap[interval];
+  if (!intervalConfig) {
+    return res.status(400).json({
+      error: "Invalid interval parameter",
+      provided: interval,
+      validIntervals: Object.keys(intervalMap)
+    });
+  }
+  
+  const now = Date.now();
+  const cutoffTime = now - intervalConfig.ms;
+  
+  // Get current price
+  const currentPrice = priceData.latestPrice;
+  if (!currentPrice) {
+    return res.status(503).json({
+      error: "Current price not available"
+    });
+  }
+  
+  // Try to get the price from the beginning of the interval
+  let startPrice = null;
+  
+  // First, try using OHLC data if available
+  if (intervalConfig.ohlcKey && priceData.ohlc[intervalConfig.ohlcKey]) {
+    const ohlcData = priceData.ohlc[intervalConfig.ohlcKey];
+    // Find the candle closest to our cutoff time
+    const relevantCandles = ohlcData.filter(candle => 
+      candle.timestamp <= cutoffTime + intervalConfig.ms && 
+      candle.timestamp >= cutoffTime - intervalConfig.ms
+    );
+    
+    if (relevantCandles.length > 0) {
+      // Use the open price of the oldest relevant candle
+      startPrice = relevantCandles[0].open;
+    }
+  }
+  
+  // If no OHLC data, fall back to historical data
+  if (!startPrice && priceData.history && priceData.history.length > 0) {
+    // Find the price closest to the cutoff time
+    let closestPrice = null;
+    let closestTimeDiff = Infinity;
+    
+    for (const item of priceData.history) {
+      const timeDiff = Math.abs(item.timestamp - cutoffTime);
+      if (timeDiff < closestTimeDiff) {
+        closestTimeDiff = timeDiff;
+        closestPrice = item.price;
+      }
+    }
+    
+    // Only use the price if it's within a reasonable range of our target time
+    // (within 10% of the interval duration)
+    if (closestTimeDiff <= intervalConfig.ms * 0.1) {
+      startPrice = closestPrice;
+    }
+  }
+  
+  if (!startPrice) {
+    return res.status(404).json({
+      error: `No historical data available for ${interval} interval`,
+      interval: interval,
+      currentPrice: currentPrice,
+      message: "Unable to calculate percentage change"
+    });
+  }
+  
+  // Calculate percentage change
+  const priceChange = currentPrice - startPrice;
+  const percentageChange = (priceChange / startPrice) * 100;
+  
+  res.json({
+    interval: interval,
+    currentPrice: currentPrice,
+    startPrice: startPrice,
+    priceChange: priceChange,
+    percentageChange: percentageChange,
+    percentageChangeFormatted: `${percentageChange >= 0 ? '+' : ''}${percentageChange.toFixed(2)}%`,
+    timestamp: now,
     lastUpdated: priceData.lastUpdated
   });
 });
