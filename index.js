@@ -5,21 +5,39 @@ import fs from "fs-extra";
 import IUniswapV3PoolABI from "./artifacts/IUniswapV3PoolAbi.json" assert { type: "json" };
 
 // Configuration
-const providerUrl = "https://rpc.ankr.com/monad_testnet";
+const providerUrl = "http://localhost:8545"; //"https://rpc.ankr.com/monad_testnet";
 const wsProviderUrl = "wss://monad-testnet.rpc.ankr.com/ws"; // WebSocket URL for events (may not be available)
-const poolAddress = "0x222705B830a38654B46340A99F5F3f1718A5C95d";
+const DEFAULT_POOL_ADDRESS = "0xBb7EfF3E685c6564F2F09DD90b6C05754E3BDAC0"; // Default pool for backward compatibility
 const dataFilePath = "./priceData.json";
 const PORT = 3001;
 const USE_WEBSOCKET = false; // Disable WebSocket for now as Monad testnet may not support it
 
+// Standard datapoint limits per interval to ensure consistency
+const DATAPOINT_LIMITS = {
+  "1m": 100,
+  "5m": 100,
+  "15m": 100,
+  "30m": 100,
+  "1h": 100,
+  "6h": 100,
+  "12h": 100,
+  "24h": 100,
+  "1w": 100,
+  "1M": 100
+};
+
 // Global providers
 let provider;
 let wsProvider;
-let poolContract;
-let wsPoolContract;
 
-// Initialize price data storage
-const priceData = {
+// Pool-specific data storage and contracts
+const poolsData = new Map(); // Map<poolAddress, poolData>
+const poolContracts = new Map(); // Map<poolAddress, Contract>
+const wsPoolContracts = new Map(); // Map<poolAddress, Contract>
+const lastProcessedBlocks = new Map(); // Map<poolAddress, blockNumber>
+
+// Initialize pool data structure
+const createPoolData = () => ({
   latestPrice: null,
   history: [],
   lastUpdated: null,
@@ -42,6 +60,62 @@ const priceData = {
     total: 0,
     lastReset: Date.now()
   }
+});
+
+// Initialize default pool data reference (will be set after loading file)
+let priceData = null;
+
+// Helper function to validate Ethereum address
+const isValidAddress = (address) => {
+  return /^0x[a-fA-F0-9]{40}$/.test(address);
+};
+
+// Initialize a new pool with initial price fetch
+const initializePool = async (poolAddress) => {
+  try {
+    console.log(`Initializing new pool: ${poolAddress}`);
+    
+    // Fetch initial price
+    await updatePrice(poolAddress);
+    
+    // Set up event listeners for this pool
+    await setupEventListenersForPool(poolAddress);
+    
+    // Set up periodic price updates for this pool
+    setInterval(() => updatePrice(poolAddress), 5000);
+    
+    console.log(`Pool ${poolAddress} initialized successfully`);
+  } catch (error) {
+    console.error(`Error initializing pool ${poolAddress}:`, error);
+  }
+};
+
+// Helper function to get or create pool data
+const getPoolData = (poolAddress) => {
+  const normalizedAddress = poolAddress.toLowerCase();
+  
+  if (!poolsData.has(normalizedAddress)) {
+    const newPoolData = createPoolData();
+    poolsData.set(normalizedAddress, newPoolData);
+  }
+  
+  return poolsData.get(normalizedAddress);
+};
+
+// Helper function to get or create pool contract
+const getPoolContract = async (poolAddress) => {
+  const normalizedAddress = poolAddress.toLowerCase();
+  
+  if (!poolContracts.has(normalizedAddress)) {
+    if (!provider) {
+      throw new Error("Provider not initialized");
+    }
+    
+    const contract = new Contract(poolAddress, IUniswapV3PoolABI.abi, provider);
+    poolContracts.set(normalizedAddress, contract);
+  }
+  
+  return poolContracts.get(normalizedAddress);
 };
 
 // Initialize express app
@@ -49,9 +123,47 @@ const app = express();
 app.use(cors()); // Enable CORS for all routes
 app.use(express.json());
 
+// Track pools being initialized
+const poolsInitializing = new Set();
+
+// Middleware to parse and validate pool parameter
+const parsePoolAddress = async (req, res, next) => {
+  // Get pool address from query parameter or use default
+  const poolAddress = req.query.pool || req.query.poolAddress || DEFAULT_POOL_ADDRESS;
+  
+  // Validate the address format
+  if (!isValidAddress(poolAddress)) {
+    return res.status(400).json({
+      error: "Invalid pool address format",
+      message: "Pool address must be a valid Ethereum address (0x followed by 40 hexadecimal characters)"
+    });
+  }
+  
+  // Normalize and attach to request
+  req.poolAddress = poolAddress;
+  req.normalizedPoolAddress = poolAddress.toLowerCase();
+  
+  // Check if this is a new pool that needs initialization
+  const normalizedAddress = poolAddress.toLowerCase();
+  if (!poolsData.has(normalizedAddress) && !poolsInitializing.has(normalizedAddress)) {
+    poolsInitializing.add(normalizedAddress);
+    
+    // Create pool data immediately
+    const newPoolData = createPoolData();
+    poolsData.set(normalizedAddress, newPoolData);
+    
+    // Initialize pool asynchronously
+    initializePool(poolAddress).finally(() => {
+      poolsInitializing.delete(normalizedAddress);
+    });
+  }
+  
+  next();
+};
+
 // Backfill historical OHLC data from existing price history
-const backfillHistoricalOHLC = () => {
-  if (priceData.history.length === 0) return;
+const backfillHistoricalOHLC = (poolData) => {
+  if (!poolData || poolData.history.length === 0) return;
 
   const intervals = {
     "1m": 1 * 60 * 1000,
@@ -68,17 +180,17 @@ const backfillHistoricalOHLC = () => {
 
   // Only backfill if OHLC arrays are empty or very small
   Object.entries(intervals).forEach(([interval, ms]) => {
-    if (priceData.ohlc[interval] && priceData.ohlc[interval].length >= 2) {
+    if (poolData.ohlc[interval] && poolData.ohlc[interval].length >= 2) {
       return; // Skip if we already have sufficient data
     }
 
     // Clear existing data for clean backfill
-    priceData.ohlc[interval] = [];
+    poolData.ohlc[interval] = [];
 
     // Process each historical price point
-    priceData.history.forEach(historyItem => {
+    poolData.history.forEach(historyItem => {
       const { price, timestamp } = historyItem;
-      const currentOHLC = priceData.ohlc[interval];
+      const currentOHLC = poolData.ohlc[interval];
 
       // Calculate the candle start time (rounded down to interval boundary)
       const roundedTimestamp = Math.floor(timestamp / ms) * ms;
@@ -110,29 +222,29 @@ const backfillHistoricalOHLC = () => {
 };
 
 // Generate longer intervals from shorter interval data
-const generateIntervalsFromExisting = () => {
+const generateIntervalsFromExisting = (poolData) => {
   // Generate 6h from 1h data
-  if (priceData.ohlc["1h"] && priceData.ohlc["1h"].length > 0) {
-    priceData.ohlc["6h"] = generateLongerInterval(priceData.ohlc["1h"], 6 * 60 * 60 * 1000);
-    console.log(`Generated ${priceData.ohlc["6h"].length} 6h candles from 1h data`);
+  if (poolData.ohlc["1h"] && poolData.ohlc["1h"].length > 0) {
+    poolData.ohlc["6h"] = generateLongerInterval(poolData.ohlc["1h"], 6 * 60 * 60 * 1000);
+    console.log(`Generated ${poolData.ohlc["6h"].length} 6h candles from 1h data`);
   }
   
   // Generate 12h from 1h data
-  if (priceData.ohlc["1h"] && priceData.ohlc["1h"].length > 0) {
-    priceData.ohlc["12h"] = generateLongerInterval(priceData.ohlc["1h"], 12 * 60 * 60 * 1000);
-    console.log(`Generated ${priceData.ohlc["12h"].length} 12h candles from 1h data`);
+  if (poolData.ohlc["1h"] && poolData.ohlc["1h"].length > 0) {
+    poolData.ohlc["12h"] = generateLongerInterval(poolData.ohlc["1h"], 12 * 60 * 60 * 1000);
+    console.log(`Generated ${poolData.ohlc["12h"].length} 12h candles from 1h data`);
   }
   
   // If no 1h data, try generating from 5m data
-  else if (priceData.ohlc["5m"] && priceData.ohlc["5m"].length > 0) {
+  else if (poolData.ohlc["5m"] && poolData.ohlc["5m"].length > 0) {
     // First generate 1h from 5m
-    priceData.ohlc["1h"] = generateLongerInterval(priceData.ohlc["5m"], 60 * 60 * 1000);
-    console.log(`Generated ${priceData.ohlc["1h"].length} 1h candles from 5m data`);
+    poolData.ohlc["1h"] = generateLongerInterval(poolData.ohlc["5m"], 60 * 60 * 1000);
+    console.log(`Generated ${poolData.ohlc["1h"].length} 1h candles from 5m data`);
     
     // Then generate 6h and 12h from the new 1h data
-    priceData.ohlc["6h"] = generateLongerInterval(priceData.ohlc["1h"], 6 * 60 * 60 * 1000);
-    priceData.ohlc["12h"] = generateLongerInterval(priceData.ohlc["1h"], 12 * 60 * 60 * 1000);
-    console.log(`Generated ${priceData.ohlc["6h"].length} 6h and ${priceData.ohlc["12h"].length} 12h candles`);
+    poolData.ohlc["6h"] = generateLongerInterval(poolData.ohlc["1h"], 6 * 60 * 60 * 1000);
+    poolData.ohlc["12h"] = generateLongerInterval(poolData.ohlc["1h"], 12 * 60 * 60 * 1000);
+    console.log(`Generated ${poolData.ohlc["6h"].length} 6h and ${poolData.ohlc["12h"].length} 12h candles`);
   }
 };
 
@@ -176,14 +288,40 @@ const initializeDataFile = async () => {
   try {
     if (await fs.pathExists(dataFilePath)) {
       const data = await fs.readJson(dataFilePath);
-      Object.assign(priceData, data);
       
-      // Ensure all OHLC intervals exist (for backward compatibility)
-      if (!priceData.ohlc["1m"]) priceData.ohlc["1m"] = [];
-      if (!priceData.ohlc["6h"]) priceData.ohlc["6h"] = [];
-      if (!priceData.ohlc["12h"]) priceData.ohlc["12h"] = [];
-      if (!priceData.ohlc["1w"]) priceData.ohlc["1w"] = [];
-      if (!priceData.ohlc["1M"]) priceData.ohlc["1M"] = [];
+      // Check if it's the new format (version 2 or has pools structure)
+      if (data.pools) {
+        // Load all pools data (normalize addresses to lowercase)
+        for (const [poolAddress, poolData] of Object.entries(data.pools)) {
+          poolsData.set(poolAddress.toLowerCase(), poolData);
+        }
+        
+        // Load volume history
+        if (data.volumeHistory) {
+          volumeHistory.push(...data.volumeHistory);
+        }
+        
+        console.log(`Loaded ${Object.keys(data.pools).length} pools from file`);
+        
+        // Set default pool data reference
+        priceData = poolsData.get(DEFAULT_POOL_ADDRESS.toLowerCase());
+        if (!priceData) {
+          // Create default pool if not in file
+          priceData = createPoolData();
+          poolsData.set(DEFAULT_POOL_ADDRESS.toLowerCase(), priceData);
+        }
+      } else {
+        // Old format - create priceData first, then load
+        priceData = createPoolData();
+        poolsData.set(DEFAULT_POOL_ADDRESS.toLowerCase(), priceData);
+        Object.assign(priceData, data);
+        
+        // Ensure all OHLC intervals exist (for backward compatibility)
+        if (!priceData.ohlc["1m"]) priceData.ohlc["1m"] = [];
+        if (!priceData.ohlc["6h"]) priceData.ohlc["6h"] = [];
+        if (!priceData.ohlc["12h"]) priceData.ohlc["12h"] = [];
+        if (!priceData.ohlc["1w"]) priceData.ohlc["1w"] = [];
+        if (!priceData.ohlc["1M"]) priceData.ohlc["1M"] = [];
       
       // Initialize volume tracking if not present
       if (!priceData.volume) {
@@ -219,15 +357,29 @@ const initializeDataFile = async () => {
       }
       
       // Backfill historical OHLC data from price history
-      backfillHistoricalOHLC();
+      backfillHistoricalOHLC(priceData);
       
-      // Generate 6h and 12h intervals from existing shorter interval data
-      generateIntervalsFromExisting();
+        // Generate 6h and 12h intervals from existing shorter interval data
+        generateIntervalsFromExisting(priceData);
+      }
       
       console.log("Loaded existing price data");
     } else {
-      await fs.writeJson(dataFilePath, priceData);
-      console.log("Created new price data file");
+      // No file exists - create default pool data
+      priceData = createPoolData();
+      poolsData.set(DEFAULT_POOL_ADDRESS.toLowerCase(), priceData);
+      
+      // Create new file with new format
+      const initialData = {
+        pools: {
+          [DEFAULT_POOL_ADDRESS.toLowerCase()]: priceData
+        },
+        volumeHistory: [],
+        version: 2,
+        lastSaved: Date.now()
+      };
+      await fs.writeJson(dataFilePath, initialData);
+      console.log("Created new price data file with v2 format");
     }
   } catch (error) {
     console.error("Error initializing data file:", error);
@@ -235,30 +387,47 @@ const initializeDataFile = async () => {
 };
 
 // Fetch the latest price from Uniswap pool
-const fetchLatestPrice = async () => {
+const fetchLatestPrice = async (poolAddress) => {
   try {
+    const poolContract = await getPoolContract(poolAddress);
     if (!poolContract) {
+      console.error(`No pool contract for ${poolAddress}`);
       return null;
     }
-    const slot0 = await poolContract.slot0();
-    const sqrtPriceX96 = slot0.sqrtPriceX96;
-    const price = (Number(sqrtPriceX96) ** 2) / 2 ** 192;
-    return price;
+    
+    // Verify the contract is a valid Uniswap V3 pool
+    try {
+      const slot0 = await poolContract.slot0();
+      const sqrtPriceX96 = slot0.sqrtPriceX96;
+      
+      if (!sqrtPriceX96 || sqrtPriceX96.toString() === '0') {
+        console.error(`Invalid price data for pool ${poolAddress}`);
+        return null;
+      }
+      
+      const price = (Number(sqrtPriceX96) ** 2) / 2 ** 192;
+      return price;
+    } catch (contractError) {
+      console.error(`Pool ${poolAddress} may not be a valid Uniswap V3 pool:`, contractError.message);
+      return null;
+    }
   } catch (error) { 
-    console.error("Error fetching price:", error);
+    console.error(`Error fetching price for ${poolAddress}:`, error.message);
     return null;
   }
 };
 
-// Track last processed block to avoid duplicates
-let lastProcessedBlock = 0;
-
-// Query past events periodically
-const queryPastEvents = async () => {
+// Query past events periodically for a specific pool
+const queryPastEvents = async (poolAddress) => {
   try {
+    const poolContract = await getPoolContract(poolAddress);
     if (!poolContract) return;
     
     const currentBlock = await provider.getBlockNumber();
+    
+    // Get last processed block for this pool
+    const normalizedAddress = poolAddress.toLowerCase();
+    let lastProcessedBlock = lastProcessedBlocks.get(normalizedAddress) || 0;
     
     // First run - start from current block
     if (lastProcessedBlock === 0) {
@@ -287,31 +456,37 @@ const queryPastEvents = async () => {
         for (const event of events) {
           const { sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick } = event.args;
           
+          // Get pool data for this pool
+          const poolData = getPoolData(poolAddress);
+          
           // Calculate volume (assuming token1 is USD - you'd need to verify this)
           const volumeUSD = calculateSwapVolume(amount0, amount1, false);
-          updateVolume(volumeUSD);
+          updateVolume(poolData, volumeUSD);
           
-          console.log(`Processed swap event: Volume $${volumeUSD.toFixed(2)}`);
+          console.log(`Pool ${poolAddress}: Processed swap event: Volume $${volumeUSD.toFixed(2)}`);
         }
       } catch (error) {
         console.error(`Error querying events for blocks ${fromBlock}-${toBlock}:`, error.message);
       }
     }
     
-    lastProcessedBlock = currentBlock;
+    // Update last processed block for this pool
+    lastProcessedBlocks.set(normalizedAddress, currentBlock);
   } catch (error) {
     console.error("Error querying past events:", error);
   }
 };
 
-// Set up event listeners for swap events
-const setupEventListeners = async () => {
+// Set up event listeners for swap events for a specific pool
+const setupEventListenersForPool = async (poolAddress) => {
   try {
     if (USE_WEBSOCKET) {
       // Try WebSocket connection if enabled
       try {
-        wsProvider = new WebSocketProvider(wsProviderUrl);
-        wsPoolContract = new Contract(poolAddress, IUniswapV3PoolABI.abi, wsProvider);
+        if (!wsProvider) {
+          wsProvider = new WebSocketProvider(wsProviderUrl);
+        }
+        const wsPoolContract = new Contract(poolAddress, IUniswapV3PoolABI.abi, wsProvider);
         
         // Get token addresses to determine which is USD
         const token0 = await wsPoolContract.token0();
@@ -320,31 +495,37 @@ const setupEventListeners = async () => {
         console.log("Token0:", token0);
         console.log("Token1:", token1);
         
+        // Store WebSocket contract for this pool
+        wsPoolContracts.set(poolAddress.toLowerCase(), wsPoolContract);
+        
         // Listen to Swap events
         wsPoolContract.on("Swap", (sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick, event) => {
           console.log("Swap event detected!");
           
+          // Get pool data
+          const poolData = getPoolData(poolAddress);
+          
           // Calculate volume
           const volumeUSD = calculateSwapVolume(amount0, amount1, false);
-          updateVolume(volumeUSD);
+          updateVolume(poolData, volumeUSD);
           
           // Update price from the event
           const price = (Number(sqrtPriceX96) ** 2) / 2 ** 192;
           const now = Date.now();
           
-          priceData.latestPrice = price;
-          priceData.lastUpdated = now;
+          poolData.latestPrice = price;
+          poolData.lastUpdated = now;
           
           // Add to history
-          priceData.history.push({
+          poolData.history.push({
             price,
             timestamp: now
           });
           
           // Update OHLC data
-          updateOHLCData(price, now);
+          updateOHLCData(poolData, price, now);
           
-          console.log(`Swap: Price: ${price}, Volume: $${volumeUSD.toFixed(2)}, Total Volume (24h): $${priceData.volume["24h"].toFixed(2)}`);
+          console.log(`Pool ${poolAddress}: Price: ${price}, Volume: $${volumeUSD.toFixed(2)}, Total Volume (24h): $${poolData.volume["24h"].toFixed(2)}`);
         });
         
         console.log("WebSocket event listeners set up successfully");
@@ -356,23 +537,31 @@ const setupEventListeners = async () => {
       console.log("WebSocket disabled, using periodic event querying");
     }
     
-    // Set up periodic event querying (runs whether WebSocket works or not)
-    setInterval(queryPastEvents, 10000); // Query every 10 seconds
+    // Set up periodic event querying for this pool
+    setInterval(() => queryPastEvents(poolAddress), 10000); // Query every 10 seconds
     
     // Initial query
-    await queryPastEvents();
+    await queryPastEvents(poolAddress);
   } catch (error) {
     console.error("Error setting up event listeners:", error);
   }
 };
 
-// Get interval prices data
-const getIntervalPrices = (minutes, limit = 10) => {
+// Set up event listeners for default pool (backward compatibility)
+const setupEventListeners = async () => {
+  await setupEventListenersForPool(DEFAULT_POOL_ADDRESS);
+};
+
+// Get interval prices data with consistent limits
+const getIntervalPrices = (poolData, minutes, intervalKey = null) => {
   const now = Date.now();
   const cutoffTime = now - (minutes * 60 * 1000);
+  
+  // Use the standard limit for the interval
+  const limit = intervalKey && DATAPOINT_LIMITS[intervalKey] ? DATAPOINT_LIMITS[intervalKey] : 100;
 
   // Filter price history to the specified interval
-  let filteredData = priceData.history
+  let filteredData = poolData.history
     .filter(item => item.timestamp >= cutoffTime)
     .map(item => ({
       price: item.price,
@@ -381,7 +570,7 @@ const getIntervalPrices = (minutes, limit = 10) => {
 
   // For longer intervals (1w, 1M), if no data in time window, use all available data
   if (filteredData.length === 0 && (minutes >= 10080)) { // 1w = 10080 minutes
-    filteredData = priceData.history
+    filteredData = poolData.history
       .map(item => ({
         price: item.price,
         timestamp: item.timestamp
@@ -408,26 +597,26 @@ const getIntervalPrices = (minutes, limit = 10) => {
 };
 
 // Clean up old price history to prevent memory issues
-const cleanupOldData = () => {
+const cleanupOldData = (poolData) => {
   const oneDayAgo = Date.now() - (24 * 60 * 60 * 1000 + 60 * 1000); // 24 hours + 1 minute buffer
-  priceData.history = priceData.history.filter(item => item.timestamp >= oneDayAgo);
+  poolData.history = poolData.history.filter(item => item.timestamp >= oneDayAgo);
 
   // Cleanup old OHLC data as well
   // For 24h candles, keep last 30 days worth
   const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
-  priceData.ohlc["24h"] = priceData.ohlc["24h"].filter(candle => candle.timestamp >= thirtyDaysAgo);
+  poolData.ohlc["24h"] = poolData.ohlc["24h"].filter(candle => candle.timestamp >= thirtyDaysAgo);
 
   // For 1h candles, keep last 7 days worth
   const sevenDaysAgo = Date.now() - (7 * 24 * 60 * 60 * 1000);
-  priceData.ohlc["1h"] = priceData.ohlc["1h"].filter(candle => candle.timestamp >= sevenDaysAgo);
+  poolData.ohlc["1h"] = poolData.ohlc["1h"].filter(candle => candle.timestamp >= sevenDaysAgo);
 
   // For 1w candles, keep last 2 years worth
   const twoYearsAgo = Date.now() - (2 * 365 * 24 * 60 * 60 * 1000);
-  priceData.ohlc["1w"] = priceData.ohlc["1w"].filter(candle => candle.timestamp >= twoYearsAgo);
+  poolData.ohlc["1w"] = poolData.ohlc["1w"].filter(candle => candle.timestamp >= twoYearsAgo);
 
   // For 1M candles, keep last 10 years worth
   const tenYearsAgo = Date.now() - (10 * 365 * 24 * 60 * 60 * 1000);
-  priceData.ohlc["1M"] = priceData.ohlc["1M"].filter(candle => candle.timestamp >= tenYearsAgo);
+  poolData.ohlc["1M"] = poolData.ohlc["1M"].filter(candle => candle.timestamp >= tenYearsAgo);
 
   // For other timeframes, we already limit by count in updateOHLCData
 };
@@ -435,11 +624,26 @@ const cleanupOldData = () => {
 // Save price data to file
 const saveDataToFile = async () => {
   try {
-    // Include volume history in saved data (limit to last 1000 entries)
+    // Save all pools data
+    const allPoolsData = {};
+    
+    for (const [poolAddress, poolData] of poolsData) {
+      allPoolsData[poolAddress] = {
+        ...poolData,
+        // Don't save volume history for now as it's global
+      };
+    }
+    
     const dataToSave = {
-      ...priceData,
-      volumeHistory: volumeHistory.slice(-1000)
+      // Save pools data
+      pools: allPoolsData,
+      // Save global volume history (limit to last 1000 entries)
+      volumeHistory: volumeHistory.slice(-1000),
+      // Metadata
+      version: 2,
+      lastSaved: Date.now()
     };
+    
     await fs.writeJson(dataFilePath, dataToSave);
   } catch (error) {
     console.error("Error saving data to file:", error);
@@ -447,7 +651,7 @@ const saveDataToFile = async () => {
 };
 
 // Process OHLC data for each interval
-const updateOHLCData = (price, timestamp) => {
+const updateOHLCData = (poolData, price, timestamp) => {
   const intervals = {
     "1m": 1 * 60 * 1000,
     "5m": 5 * 60 * 1000,
@@ -462,7 +666,7 @@ const updateOHLCData = (price, timestamp) => {
   };
 
   Object.entries(intervals).forEach(([interval, ms]) => {
-    const currentOHLC = priceData.ohlc[interval];
+    const currentOHLC = poolData.ohlc[interval];
 
     // If no candles exist or the last candle is complete, create a new one
     if (currentOHLC.length === 0 ||
@@ -488,23 +692,9 @@ const updateOHLCData = (price, timestamp) => {
       currentCandle.volume += 1;
     }
 
-    // Limit the number of candles to keep memory usage reasonable
-    // Keep approximately 100 candles per timeframe
-    const maxCandles = {
-      "1m": 100,
-      "5m": 100,
-      "15m": 100,
-      "30m": 100,
-      "1h": 100,
-      "6h": 100,
-      "12h": 100,
-      "24h": 100,
-      "1w": 100,
-      "1M": 100
-    };
-
-    if (currentOHLC.length > maxCandles[interval]) {
-      priceData.ohlc[interval] = currentOHLC.slice(-maxCandles[interval]);
+    // Limit the number of candles using standard limits
+    if (currentOHLC.length > DATAPOINT_LIMITS[interval]) {
+      poolData.ohlc[interval] = currentOHLC.slice(-DATAPOINT_LIMITS[interval]);
     }
   });
 };
@@ -513,7 +703,7 @@ const updateOHLCData = (price, timestamp) => {
 const volumeHistory = [];
 
 // Update volume tracking from actual swap events
-const updateVolume = (volumeInUSD) => {
+const updateVolume = (poolData, volumeInUSD) => {
   const now = Date.now();
   
   // Add to volume history
@@ -523,7 +713,7 @@ const updateVolume = (volumeInUSD) => {
   });
   
   // Add to total volume
-  priceData.volume.total += volumeInUSD;
+  poolData.volume.total += volumeInUSD;
   
   // Calculate volume for each period based on actual history
   const dayAgo = now - 24 * 60 * 60 * 1000;
@@ -531,15 +721,15 @@ const updateVolume = (volumeInUSD) => {
   const monthAgo = now - 30 * 24 * 60 * 60 * 1000;
   
   // Recalculate volumes based on history
-  priceData.volume["24h"] = volumeHistory
+  poolData.volume["24h"] = volumeHistory
     .filter(v => v.timestamp >= dayAgo)
     .reduce((sum, v) => sum + v.volume, 0);
     
-  priceData.volume["7d"] = volumeHistory
+  poolData.volume["7d"] = volumeHistory
     .filter(v => v.timestamp >= weekAgo)
     .reduce((sum, v) => sum + v.volume, 0);
     
-  priceData.volume["30d"] = volumeHistory
+  poolData.volume["30d"] = volumeHistory
     .filter(v => v.timestamp >= monthAgo)
     .reduce((sum, v) => sum + v.volume, 0);
   
@@ -566,26 +756,27 @@ const calculateSwapVolume = (amount0, amount1, token0IsUSD) => {
   }
 };
 
-// Main price update function
-const updatePrice = async () => {
-  const price = await fetchLatestPrice();
+// Main price update function for a specific pool
+const updatePrice = async (poolAddress) => {
+  const price = await fetchLatestPrice(poolAddress);
+  const poolData = getPoolData(poolAddress);
 
   if (price !== null) {
     const now = Date.now();
-    priceData.latestPrice = price;
-    priceData.lastUpdated = now;
+    poolData.latestPrice = price;
+    poolData.lastUpdated = now;
 
     // Add to history
-    priceData.history.push({
+    poolData.history.push({
       price,
       timestamp: now
     });
 
     // Update OHLC data
-    updateOHLCData(price, now);
+    updateOHLCData(poolData, price, now);
     
     // Clean up old data
-    cleanupOldData();
+    cleanupOldData(poolData);
 
     // Save to file (every minute to avoid excessive disk writes)
     if (now % (60 * 1000) < 1000) {
@@ -625,12 +816,29 @@ const filterOHLCByTimeRange = (ohlcData, fromTimestamp, toTimestamp) => {
   });
 };
 
+// Helper function to limit datapoints consistently
+const limitDatapoints = (data, intervalKey) => {
+  if (!data || data.length === 0) return data;
+  
+  const limit = DATAPOINT_LIMITS[intervalKey] || 100;
+  
+  if (data.length <= limit) {
+    return data;
+  }
+  
+  // Take the most recent datapoints up to the limit
+  return data.slice(-limit);
+};
+
 
 // API Endpoints
-app.get("/api/price", (req, res) => {
+app.get("/api/price", parsePoolAddress, (req, res) => {
+  const poolData = getPoolData(req.poolAddress);
+  
   res.json({
-    latest: priceData.latestPrice,
-    lastUpdated: priceData.lastUpdated
+    pool: req.poolAddress,
+    latest: poolData.latestPrice,
+    lastUpdated: poolData.lastUpdated
   });
 });
 
@@ -652,16 +860,41 @@ app.get("/api/test/price-stats", async (req, res) => {
   }
 });
 
-app.get("/api/price/latest", (req, res) => {
+// Debug endpoint to check pool data
+app.get("/api/debug/pool", parsePoolAddress, (req, res) => {
+  const poolData = getPoolData(req.poolAddress);
+  
   res.json({
-    latest: priceData.latestPrice,
-    lastUpdated: priceData.lastUpdated
+    pool: req.poolAddress,
+    normalizedPool: req.normalizedPoolAddress,
+    hasData: poolsData.has(req.normalizedPoolAddress),
+    latestPrice: poolData.latestPrice,
+    historyLength: poolData.history ? poolData.history.length : 0,
+    ohlcKeys: Object.keys(poolData.ohlc || {}),
+    ohlcDataLengths: Object.entries(poolData.ohlc || {}).reduce((acc, [key, value]) => {
+      acc[key] = Array.isArray(value) ? value.length : 0;
+      return acc;
+    }, {}),
+    volume: poolData.volume,
+    lastUpdated: poolData.lastUpdated,
+    allPoolKeys: Array.from(poolsData.keys())
+  });
+});
+
+app.get("/api/price/latest", parsePoolAddress, (req, res) => {
+  const poolData = getPoolData(req.poolAddress);
+  
+  res.json({
+    pool: req.poolAddress,
+    latest: poolData.latestPrice,
+    lastUpdated: poolData.lastUpdated
   });
 });
 
 // New time-based query endpoint
-app.get("/api/price/query", (req, res) => {
+app.get("/api/price/query", parsePoolAddress, (req, res) => {
   const { from_timestamp, to_timestamp, interval } = req.query;
+  const poolData = getPoolData(req.poolAddress);
   
   // Validate required parameters
   if (!interval) {
@@ -711,24 +944,28 @@ app.get("/api/price/query", (req, res) => {
   }
   
   // Get OHLC data for the interval
-  const ohlcData = priceData.ohlc[intervalKey] || [];
+  const ohlcData = poolData.ohlc[intervalKey] || [];
   
   // Filter data by timestamp range
   const filteredData = filterOHLCByTimeRange(ohlcData, fromTimestamp, toTimestamp);
+  
+  // Apply consistent datapoint limiting
+  const limitedData = limitDatapoints(filteredData, intervalKey);
   
   res.json({
     interval: intervalKey,
     from_timestamp: fromTimestamp,
     to_timestamp: toTimestamp,
-    count: filteredData.length,
-    ohlc: filteredData,
+    count: limitedData.length,
+    ohlc: limitedData,
     lastUpdated: priceData.lastUpdated
   });
 });
 
 // OHLC endpoint with query parameters for interval and time filtering
-app.get("/api/price/ohlc", (req, res) => {
+app.get("/api/price/ohlc", parsePoolAddress, (req, res) => {
   const { interval, from_timestamp, to_timestamp } = req.query;
+  const poolData = getPoolData(req.poolAddress);
   
   // Validate required parameters
   if (!interval) {
@@ -778,33 +1015,40 @@ app.get("/api/price/ohlc", (req, res) => {
   }
   
   // Get OHLC data for the interval
-  const ohlcData = priceData.ohlc[intervalKey] || [];
+  const ohlcData = poolData.ohlc[intervalKey] || [];
   
   // Filter data by timestamp range
   const filteredData = filterOHLCByTimeRange(ohlcData, fromTimestamp, toTimestamp);
+  
+  // Apply consistent datapoint limiting
+  const limitedData = limitDatapoints(filteredData, intervalKey);
   
   res.json({
     interval: intervalKey,
     from_timestamp: fromTimestamp,
     to_timestamp: toTimestamp,
-    count: filteredData.length,
-    ohlc: filteredData,
+    count: limitedData.length,
+    ohlc: limitedData,
     lastUpdated: priceData.lastUpdated
   });
 });
 
 // Add a dedicated endpoint to get all OHLC data
-app.get("/api/price/ohlc/all", (req, res) => {
+app.get("/api/price/ohlc/all", parsePoolAddress, (req, res) => {
+  const poolData = getPoolData(req.poolAddress);
+  
   res.json({
-    ohlc: priceData.ohlc,
-    lastUpdated: priceData.lastUpdated
+    pool: req.poolAddress,
+    ohlc: poolData.ohlc,
+    lastUpdated: poolData.lastUpdated
   });
 });
 
 // Enhanced OHLC endpoint with optional time filtering
-app.get("/api/price/ohlc/:interval", (req, res) => {
+app.get("/api/price/ohlc/:interval", parsePoolAddress, (req, res) => {
   const interval = req.params.interval;
   const { from_timestamp, to_timestamp } = req.query;
+  const poolData = getPoolData(req.poolAddress);
   
   const intervalKey = mapInterval(interval);
   
@@ -838,21 +1082,24 @@ app.get("/api/price/ohlc/:interval", (req, res) => {
     }
   }
   
-  const ohlcData = priceData.ohlc[intervalKey] || [];
+  const ohlcData = poolData.ohlc[intervalKey] || [];
   
   // Filter data by timestamp range if timestamps are provided
   const filteredData = (fromTimestamp || toTimestamp) ? 
     filterOHLCByTimeRange(ohlcData, fromTimestamp, toTimestamp) : 
     ohlcData;
 
-  if (filteredData.length > 0) {
+  // Apply consistent datapoint limiting
+  const limitedData = limitDatapoints(filteredData, intervalKey);
+
+  if (limitedData.length > 0) {
     res.json({
       interval: intervalKey,
       from_timestamp: fromTimestamp,
       to_timestamp: toTimestamp,
-      count: filteredData.length,
-      ohlc: filteredData,
-      lastUpdated: priceData.lastUpdated
+      count: limitedData.length,
+      ohlc: limitedData,
+      lastUpdated: poolData.lastUpdated
     });
   } else {
     res.status(404).json({
@@ -865,9 +1112,10 @@ app.get("/api/price/ohlc/:interval", (req, res) => {
 });
 
 // Legacy endpoint for backward compatibility
-app.get("/api/price/:interval", (req, res) => {
+app.get("/api/price/:interval", parsePoolAddress, (req, res) => {
   const interval = req.params.interval;
   const { from_timestamp, to_timestamp } = req.query;
+  const poolData = getPoolData(req.poolAddress);
   
   const intervalKey = mapInterval(interval);
 
@@ -900,21 +1148,24 @@ app.get("/api/price/:interval", (req, res) => {
   }
 
   // Use OHLC data if available, otherwise fall back to the old method
-  if (priceData.ohlc[intervalKey] && priceData.ohlc[intervalKey].length > 0) {
-    const ohlcData = priceData.ohlc[intervalKey];
+  if (poolData.ohlc[intervalKey] && poolData.ohlc[intervalKey].length > 0) {
+    const ohlcData = poolData.ohlc[intervalKey];
     
     // Filter data by timestamp range if timestamps are provided
     const filteredData = (fromTimestamp || toTimestamp) ? 
       filterOHLCByTimeRange(ohlcData, fromTimestamp, toTimestamp) : 
       ohlcData;
     
+    // Apply consistent datapoint limiting
+    const limitedData = limitDatapoints(filteredData, intervalKey);
+    
     res.json({
       interval: intervalKey,
       from_timestamp: fromTimestamp,
       to_timestamp: toTimestamp,
-      count: filteredData.length,
-      ohlc: filteredData,
-      lastUpdated: priceData.lastUpdated
+      count: limitedData.length,
+      ohlc: limitedData,
+      lastUpdated: poolData.lastUpdated
     });
   } else {
     // Fall back to legacy data method
@@ -927,7 +1178,7 @@ app.get("/api/price/:interval", (req, res) => {
                 intervalKey === "1M" ? 43200 :
                 parseInt(intervalKey);
 
-    const intervalData = getIntervalPrices(minutes);
+    const intervalData = getIntervalPrices(poolData, minutes, intervalKey);
     
     // Filter legacy data by timestamp if provided
     let filteredData = intervalData;
@@ -965,20 +1216,21 @@ app.get("/api/price/:interval", (req, res) => {
         min,
         max
       },
-      lastUpdated: priceData.lastUpdated
+      lastUpdated: poolData.lastUpdated
     });
   }
 });
 
 // Define fixed-path routes before parameter routes
-app.get("/api/price/all", (req, res) => {
+app.get("/api/price/all", parsePoolAddress, (req, res) => {
+  const poolData = getPoolData(req.poolAddress);
   const intervalKeys = ["1m", "5m", "15m", "30m", "1h", "6h", "12h", "24h", "1w", "1M"];
   const result = {};
 
   intervalKeys.forEach(intervalKey => {
-    if (priceData.ohlc[intervalKey] && priceData.ohlc[intervalKey].length > 0) {
-      // Use OHLC data
-      result[intervalKey] = priceData.ohlc[intervalKey];
+    if (poolData.ohlc[intervalKey] && poolData.ohlc[intervalKey].length > 0) {
+      // Use OHLC data with consistent limiting
+      result[intervalKey] = limitDatapoints(poolData.ohlc[intervalKey], intervalKey);
     } else {
       // Fall back to legacy method
       const minutes = intervalKey === "1m" ? 1 :
@@ -989,7 +1241,7 @@ app.get("/api/price/all", (req, res) => {
                       intervalKey === "1w" ? 10080 :
                       intervalKey === "1M" ? 43200 :
                       parseInt(intervalKey);
-      result[intervalKey] = getIntervalPrices(minutes);
+      result[intervalKey] = getIntervalPrices(poolData, minutes, intervalKey);
     }
   });
 
@@ -999,14 +1251,15 @@ app.get("/api/price/all", (req, res) => {
   });
 });
 
-app.get("/api/price/intervals/all", (req, res) => {
+app.get("/api/price/intervals/all", parsePoolAddress, (req, res) => {
+  const poolData = getPoolData(req.poolAddress);
   const intervalKeys = ["1m", "5m", "15m", "30m", "1h", "6h", "12h", "24h", "1w", "1M"];
   const result = {};
 
   intervalKeys.forEach(intervalKey => {
-    if (priceData.ohlc[intervalKey] && priceData.ohlc[intervalKey].length > 0) {
-      // Use OHLC data
-      result[intervalKey] = priceData.ohlc[intervalKey];
+    if (poolData.ohlc[intervalKey] && poolData.ohlc[intervalKey].length > 0) {
+      // Use OHLC data with consistent limiting
+      result[intervalKey] = limitDatapoints(poolData.ohlc[intervalKey], intervalKey);
     } else {
       // Fall back to legacy method
       const minutes = intervalKey === "1m" ? 1 :
@@ -1017,7 +1270,7 @@ app.get("/api/price/intervals/all", (req, res) => {
                       intervalKey === "1w" ? 10080 :
                       intervalKey === "1M" ? 43200 :
                       parseInt(intervalKey);
-      result[intervalKey] = getIntervalPrices(minutes);
+      result[intervalKey] = getIntervalPrices(poolData, minutes, intervalKey);
     }
   });
 
@@ -1028,16 +1281,20 @@ app.get("/api/price/intervals/all", (req, res) => {
 });
 
 // Volume endpoint to get volume data
-app.get("/api/volume", (req, res) => {
+app.get("/api/volume", parsePoolAddress, (req, res) => {
+  const poolData = getPoolData(req.poolAddress);
+  
   res.json({
-    volume: priceData.volume,
-    lastUpdated: priceData.lastUpdated
+    pool: req.poolAddress,
+    volume: poolData.volume,
+    lastUpdated: poolData.lastUpdated
   });
 });
 
 // Stats endpoint to calculate price percentage changes
-app.get("/api/stats", (req, res) => {
+app.get("/api/stats", parsePoolAddress, (req, res) => {
   const { interval } = req.query;
+  const poolData = getPoolData(req.poolAddress);
   
   if (!interval) {
     return res.status(400).json({
@@ -1074,10 +1331,16 @@ app.get("/api/stats", (req, res) => {
   const cutoffTime = now - intervalConfig.ms;
   
   // Get current price
-  const currentPrice = priceData.latestPrice;
+  const currentPrice = poolData.latestPrice;
   if (!currentPrice) {
+    const isInitializing = poolsInitializing.has(req.normalizedPoolAddress);
     return res.status(503).json({
-      error: "Current price not available"
+      error: "Current price not available",
+      message: isInitializing 
+        ? "Pool is being initialized. Please try again in a few seconds." 
+        : "No price data available for this pool yet.",
+      pool: req.poolAddress,
+      status: isInitializing ? "initializing" : "no_data"
     });
   }
   
@@ -1085,8 +1348,8 @@ app.get("/api/stats", (req, res) => {
   let startPrice = null;
   
   // First, try using OHLC data if available
-  if (intervalConfig.ohlcKey && priceData.ohlc[intervalConfig.ohlcKey]) {
-    const ohlcData = priceData.ohlc[intervalConfig.ohlcKey];
+  if (intervalConfig.ohlcKey && poolData.ohlc[intervalConfig.ohlcKey]) {
+    const ohlcData = poolData.ohlc[intervalConfig.ohlcKey];
     // Find the candle that contains our cutoff time
     let closestCandle = null;
     let closestTimeDiff = Infinity;
@@ -1114,12 +1377,12 @@ app.get("/api/stats", (req, res) => {
   }
   
   // If no OHLC data, fall back to historical data
-  if (!startPrice && priceData.history && priceData.history.length > 0) {
+  if (!startPrice && poolData.history && poolData.history.length > 0) {
     // Find the price closest to the cutoff time
     let closestPrice = null;
     let closestTimeDiff = Infinity;
     
-    for (const item of priceData.history) {
+    for (const item of poolData.history) {
       const timeDiff = Math.abs(item.timestamp - cutoffTime);
       if (timeDiff < closestTimeDiff) {
         closestTimeDiff = timeDiff;
@@ -1150,15 +1413,15 @@ app.get("/api/stats", (req, res) => {
   // Get appropriate volume based on interval
   let volumeForInterval = 0;
   if (interval === "24h" || interval === "1d") {
-    volumeForInterval = priceData.volume["24h"];
+    volumeForInterval = poolData.volume["24h"];
   } else if (interval === "7d") {
-    volumeForInterval = priceData.volume["7d"];
+    volumeForInterval = poolData.volume["7d"];
   } else if (interval === "30d") {
-    volumeForInterval = priceData.volume["30d"];
+    volumeForInterval = poolData.volume["30d"];
   } else {
     // For shorter intervals, estimate based on 24h volume
     const hoursInInterval = intervalConfig.ms / (60 * 60 * 1000);
-    volumeForInterval = (priceData.volume["24h"] / 24) * hoursInInterval;
+    volumeForInterval = (poolData.volume["24h"] / 24) * hoursInInterval;
   }
   
   res.json({
@@ -1170,10 +1433,10 @@ app.get("/api/stats", (req, res) => {
     percentageChangeFormatted: `${percentageChange >= 0 ? '+' : ''}${percentageChange.toFixed(2)}%`,
     volume: {
       interval: volumeForInterval,
-      "24h": priceData.volume["24h"],
-      "7d": priceData.volume["7d"],
-      "30d": priceData.volume["30d"],
-      total: priceData.volume.total
+      "24h": poolData.volume["24h"],
+      "7d": poolData.volume["7d"],
+      "30d": poolData.volume["30d"],
+      total: poolData.volume.total
     },
     timestamp: now,
     lastUpdated: priceData.lastUpdated
@@ -1187,13 +1450,15 @@ const init = async () => {
   
   // Set up providers
   provider = new JsonRpcProvider(providerUrl);
-  poolContract = new Contract(poolAddress, IUniswapV3PoolABI.abi, provider);
+  
+  // Initialize default pool contract
+  const defaultContract = await getPoolContract(DEFAULT_POOL_ADDRESS);
   
   // Set up event listeners for real-time volume tracking
   await setupEventListeners();
   
-  // Start price update interval (still useful for regular price updates if events are missed)
-  setInterval(updatePrice, 5000); // Reduced frequency since we also get updates from events
+  // Start price update interval for default pool (still useful for regular price updates if events are missed)
+  setInterval(() => updatePrice(DEFAULT_POOL_ADDRESS), 5000); // Reduced frequency since we also get updates from events
   
   // Start API server
   app.listen(PORT, () => {
