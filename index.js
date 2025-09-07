@@ -1409,20 +1409,48 @@ app.get("/api/stats", parsePoolAddress, (req, res) => {
 
 // Initialize and start the app
 const init = async () => {
-  // Initialize data file
-  await initializeDataFile();
-  
-  // Set up providers
-  provider = new JsonRpcProvider(providerUrl);
-  
-  // No default pool initialization - pools are initialized on demand when accessed
-  
-  // Start API server
-  app.listen(PORT, () => {
-    console.log(`Price API server running on port ${PORT}`);
-  });
+  try {
+    console.log("Starting initialization...");
+    
+    // Initialize data file
+    await initializeDataFile();
+    console.log("Data file initialized");
+    
+    // Set up providers
+    console.log(`Setting up provider with URL: ${providerUrl}`);
+    provider = new JsonRpcProvider(providerUrl);
+    console.log("Provider initialized");
+    
+    // No default pool initialization - pools are initialized on demand when accessed
+    
+    // Start API server
+    const server = app.listen(PORT, () => {
+      console.log(`Price API server running on port ${PORT}`);
+      console.log("Server is ready to accept connections");
+    });
+    
+    // Add error handler for server
+    server.on('error', (error) => {
+      console.error('Server error:', error);
+      process.exit(1);
+    });
+    
+    // Keep the process alive
+    process.on('SIGINT', () => {
+      console.log('\nShutting down server...');
+      server.close(() => {
+        console.log('Server closed');
+        process.exit(0);
+      });
+    });
+    
+  } catch (error) {
+    console.error("Fatal initialization error:", error);
+    process.exit(1);
+  }
 };
 
 init().catch(error => {
   console.error("Initialization error:", error);
+  process.exit(1);
 });
