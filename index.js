@@ -12,7 +12,7 @@ dotenv.config();
 const isLocalChain = process.env.CHAIN === "local";
 const providerUrl = isLocalChain ? "http://localhost:8545" : (process.env.RPC_URL || "https://rpc.ankr.com/monad_testnet");
 const wsProviderUrl = "wss://monad-testnet.rpc.ankr.com/ws"; // WebSocket URL for events (may not be available)
-const DEFAULT_POOL_ADDRESS = "0xBb7EfF3E685c6564F2F09DD90b6C05754E3BDAC0"; // Default pool for backward compatibility
+// Removed hardcoded default pool - pool parameter is now required for all endpoints
 const dataFilePath = isLocalChain ? "./priceData_local.json" : "./priceData.json";
 const PORT = process.env.PORT || 3001;
 const USE_WEBSOCKET = false; // Disable WebSocket for now as Monad testnet may not support it
@@ -133,8 +133,16 @@ const poolsInitializing = new Set();
 
 // Middleware to parse and validate pool parameter
 const parsePoolAddress = async (req, res, next) => {
-  // Get pool address from query parameter or use default
-  const poolAddress = req.query.pool || req.query.poolAddress || DEFAULT_POOL_ADDRESS;
+  // Get pool address from query parameter
+  const poolAddress = req.query.pool || req.query.poolAddress;
+  
+  // Check if pool parameter is provided
+  if (!poolAddress) {
+    return res.status(400).json({
+      error: "Missing required parameter: pool",
+      message: "Pool address is required. Use ?pool=0x... or ?poolAddress=0x..."
+    });
+  }
   
   // Validate the address format
   if (!isValidAddress(poolAddress)) {
@@ -308,18 +316,14 @@ const initializeDataFile = async () => {
         
         console.log(`Loaded ${Object.keys(data.pools).length} pools from file`);
         
-        // Set default pool data reference
-        priceData = poolsData.get(DEFAULT_POOL_ADDRESS.toLowerCase());
-        if (!priceData) {
-          // Create default pool if not in file
-          priceData = createPoolData();
-          poolsData.set(DEFAULT_POOL_ADDRESS.toLowerCase(), priceData);
-        }
+        // No default pool - priceData will be null until a pool is accessed
+        priceData = null;
       } else {
-        // Old format - create priceData first, then load
-        priceData = createPoolData();
-        poolsData.set(DEFAULT_POOL_ADDRESS.toLowerCase(), priceData);
-        Object.assign(priceData, data);
+        // Old format - migrate data to pools structure
+        // Assuming the old data was for a specific pool, we'll need the pool address from somewhere
+        // For now, we'll skip loading old format data
+        console.log("Warning: Old format data file detected. Please migrate to new format.");
+        priceData = null;
         
         // Ensure all OHLC intervals exist (for backward compatibility)
         if (!priceData.ohlc["1m"]) priceData.ohlc["1m"] = [];
@@ -370,15 +374,12 @@ const initializeDataFile = async () => {
       
       console.log("Loaded existing price data");
     } else {
-      // No file exists - create default pool data
-      priceData = createPoolData();
-      poolsData.set(DEFAULT_POOL_ADDRESS.toLowerCase(), priceData);
+      // No file exists - create empty pools structure
+      priceData = null;
       
       // Create new file with new format
       const initialData = {
-        pools: {
-          [DEFAULT_POOL_ADDRESS.toLowerCase()]: priceData
-        },
+        pools: {},
         volumeHistory: [],
         version: 2,
         lastSaved: Date.now()
@@ -552,10 +553,7 @@ const setupEventListenersForPool = async (poolAddress) => {
   }
 };
 
-// Set up event listeners for default pool (backward compatibility)
-const setupEventListeners = async () => {
-  await setupEventListenersForPool(DEFAULT_POOL_ADDRESS);
-};
+// Removed default pool event listeners - pools are initialized on demand
 
 // Get interval prices data with consistent limits
 const getIntervalPrices = (poolData, minutes, intervalKey = null) => {
@@ -1456,14 +1454,7 @@ const init = async () => {
   // Set up providers
   provider = new JsonRpcProvider(providerUrl);
   
-  // Initialize default pool contract
-  const defaultContract = await getPoolContract(DEFAULT_POOL_ADDRESS);
-  
-  // Set up event listeners for real-time volume tracking
-  await setupEventListeners();
-  
-  // Start price update interval for default pool (still useful for regular price updates if events are missed)
-  setInterval(() => updatePrice(DEFAULT_POOL_ADDRESS), 5000); // Reduced frequency since we also get updates from events
+  // No default pool initialization - pools are initialized on demand when accessed
   
   // Start API server
   app.listen(PORT, () => {
