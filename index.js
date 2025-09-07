@@ -217,7 +217,7 @@ const backfillHistoricalOHLC = (poolData) => {
       }
     });
 
-    console.log(`Backfilled ${priceData.ohlc[interval].length} candles for ${interval} interval`);
+    console.log(`Backfilled ${poolData.ohlc[interval].length} candles for ${interval} interval`);
   });
 };
 
@@ -958,7 +958,7 @@ app.get("/api/price/query", parsePoolAddress, (req, res) => {
     to_timestamp: toTimestamp,
     count: limitedData.length,
     ohlc: limitedData,
-    lastUpdated: priceData.lastUpdated
+    lastUpdated: poolData.lastUpdated
   });
 });
 
@@ -1029,7 +1029,7 @@ app.get("/api/price/ohlc", parsePoolAddress, (req, res) => {
     to_timestamp: toTimestamp,
     count: limitedData.length,
     ohlc: limitedData,
-    lastUpdated: priceData.lastUpdated
+    lastUpdated: poolData.lastUpdated
   });
 });
 
@@ -1247,7 +1247,7 @@ app.get("/api/price/all", parsePoolAddress, (req, res) => {
 
   res.json({
     intervals: result,
-    lastUpdated: priceData.lastUpdated
+    lastUpdated: poolData.lastUpdated
   });
 });
 
@@ -1276,7 +1276,7 @@ app.get("/api/price/intervals/all", parsePoolAddress, (req, res) => {
 
   res.json({
     intervals: result,
-    lastUpdated: priceData.lastUpdated
+    lastUpdated: poolData.lastUpdated
   });
 });
 
@@ -1439,7 +1439,7 @@ app.get("/api/stats", parsePoolAddress, (req, res) => {
       total: poolData.volume.total
     },
     timestamp: now,
-    lastUpdated: priceData.lastUpdated
+    lastUpdated: poolData.lastUpdated
   });
 });
 
