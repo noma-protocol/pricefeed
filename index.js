@@ -2,14 +2,19 @@ import { ethers, Contract, JsonRpcProvider, WebSocketProvider } from "ethers";
 import express from "express";
 import cors from "cors";
 import fs from "fs-extra";
+import dotenv from "dotenv";
 import IUniswapV3PoolABI from "./artifacts/IUniswapV3PoolAbi.json" assert { type: "json" };
 
+// Load environment variables
+dotenv.config();
+
 // Configuration
-const providerUrl = "http://localhost:8545"; //"https://rpc.ankr.com/monad_testnet";
+const isLocalChain = process.env.CHAIN === "local";
+const providerUrl = isLocalChain ? "http://localhost:8545" : (process.env.RPC_URL || "https://rpc.ankr.com/monad_testnet");
 const wsProviderUrl = "wss://monad-testnet.rpc.ankr.com/ws"; // WebSocket URL for events (may not be available)
 const DEFAULT_POOL_ADDRESS = "0xBb7EfF3E685c6564F2F09DD90b6C05754E3BDAC0"; // Default pool for backward compatibility
-const dataFilePath = "./priceData.json";
-const PORT = 3001;
+const dataFilePath = isLocalChain ? "./priceData_local.json" : "./priceData.json";
+const PORT = process.env.PORT || 3001;
 const USE_WEBSOCKET = false; // Disable WebSocket for now as Monad testnet may not support it
 
 // Standard datapoint limits per interval to ensure consistency
