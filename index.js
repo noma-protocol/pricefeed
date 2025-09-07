@@ -320,56 +320,17 @@ const initializeDataFile = async () => {
         priceData = null;
       } else {
         // Old format - migrate data to pools structure
-        // Assuming the old data was for a specific pool, we'll need the pool address from somewhere
-        // For now, we'll skip loading old format data
-        console.log("Warning: Old format data file detected. Please migrate to new format.");
-        priceData = null;
+        console.log("Warning: Old format data file detected. Creating new empty data file.");
         
-        // Ensure all OHLC intervals exist (for backward compatibility)
-        if (!priceData.ohlc["1m"]) priceData.ohlc["1m"] = [];
-        if (!priceData.ohlc["6h"]) priceData.ohlc["6h"] = [];
-        if (!priceData.ohlc["12h"]) priceData.ohlc["12h"] = [];
-        if (!priceData.ohlc["1w"]) priceData.ohlc["1w"] = [];
-        if (!priceData.ohlc["1M"]) priceData.ohlc["1M"] = [];
-      
-      // Initialize volume tracking if not present
-      if (!priceData.volume) {
-        priceData.volume = {
-          "24h": 0,
-          "7d": 0,
-          "30d": 0,
-          total: 0,
-          lastReset: Date.now()
+        // Create new empty data file
+        const initialData = {
+          pools: {},
+          volumeHistory: [],
+          version: 2,
+          lastSaved: Date.now()
         };
-      }
-      
-      // Load volume history if saved
-      if (data.volumeHistory) {
-        volumeHistory.push(...data.volumeHistory);
-        // Recalculate volumes based on history
-        const now = Date.now();
-        const dayAgo = now - 24 * 60 * 60 * 1000;
-        const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
-        const monthAgo = now - 30 * 24 * 60 * 60 * 1000;
-        
-        priceData.volume["24h"] = volumeHistory
-          .filter(v => v.timestamp >= dayAgo)
-          .reduce((sum, v) => sum + v.volume, 0);
-          
-        priceData.volume["7d"] = volumeHistory
-          .filter(v => v.timestamp >= weekAgo)
-          .reduce((sum, v) => sum + v.volume, 0);
-          
-        priceData.volume["30d"] = volumeHistory
-          .filter(v => v.timestamp >= monthAgo)
-          .reduce((sum, v) => sum + v.volume, 0);
-      }
-      
-      // Backfill historical OHLC data from price history
-      backfillHistoricalOHLC(priceData);
-      
-        // Generate 6h and 12h intervals from existing shorter interval data
-        generateIntervalsFromExisting(priceData);
+        await fs.writeJson(dataFilePath, initialData);
+        console.log("Created new empty data file with v2 format");
       }
       
       console.log("Loaded existing price data");
