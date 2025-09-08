@@ -217,8 +217,7 @@ const backfillHistoricalOHLC = (poolData) => {
           open: price,
           high: price,
           low: price,
-          close: price,
-          volume: 1
+          close: price
         });
       } else {
         // Update the current candle
@@ -226,7 +225,6 @@ const backfillHistoricalOHLC = (poolData) => {
         currentCandle.high = Math.max(currentCandle.high, price);
         currentCandle.low = Math.min(currentCandle.low, price);
         currentCandle.close = price;
-        currentCandle.volume += 1;
       }
     });
 
@@ -279,8 +277,7 @@ const generateLongerInterval = (sourceCandles, targetIntervalMs) => {
         open: candle.open,
         high: candle.high,
         low: candle.low,
-        close: candle.close,
-        volume: candle.volume
+        close: candle.close
       };
       result.push(targetCandle);
     } else {
@@ -288,7 +285,6 @@ const generateLongerInterval = (sourceCandles, targetIntervalMs) => {
       targetCandle.high = Math.max(targetCandle.high, candle.high);
       targetCandle.low = Math.min(targetCandle.low, candle.low);
       targetCandle.close = candle.close; // Last close becomes the period close
-      targetCandle.volume += candle.volume;
     }
   });
   
@@ -644,8 +640,7 @@ const updateOHLCData = (poolData, price, timestamp) => {
         open: price,
         high: price,
         low: price,
-        close: price,
-        volume: 1 // Simple count of updates
+        close: price
       });
     } else {
       // Update the current candle
@@ -653,7 +648,6 @@ const updateOHLCData = (poolData, price, timestamp) => {
       currentCandle.high = Math.max(currentCandle.high, price);
       currentCandle.low = Math.min(currentCandle.low, price);
       currentCandle.close = price;
-      currentCandle.volume += 1;
     }
 
     // Limit the number of candles using standard limits
