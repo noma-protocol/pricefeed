@@ -1461,7 +1461,16 @@ const init = async () => {
     provider = new JsonRpcProvider(providerUrl);
     console.log("Provider initialized");
     
-    // No default pool initialization - pools are initialized on demand when accessed
+    // Initialize monitoring for existing pools
+    if (poolsData.size > 0) {
+      console.log(`Initializing monitoring for ${poolsData.size} existing pools...`);
+      for (const [poolAddress, poolData] of poolsData.entries()) {
+        console.log(`Starting monitoring for pool: ${poolAddress}`);
+        await initializePool(poolAddress);
+      }
+    } else {
+      console.log("No existing pools to monitor");
+    }
     
     // Start API server
     const server = app.listen(PORT, () => {
