@@ -212,9 +212,12 @@ const backfillHistoricalOHLC = (poolData) => {
       if (currentOHLC.length === 0 || 
           currentOHLC[currentOHLC.length - 1].timestamp !== roundedTimestamp) {
         
+        // For continuity: new candle's open should equal previous candle's close
+        const openPrice = currentOHLC.length > 0 ? currentOHLC[currentOHLC.length - 1].close : price;
+        
         currentOHLC.push({
           timestamp: roundedTimestamp,
-          open: price,
+          open: openPrice,
           high: price,
           low: price,
           close: price
@@ -292,6 +295,33 @@ const generateLongerInterval = (sourceCandles, targetIntervalMs) => {
   return result.sort((a, b) => a.timestamp - b.timestamp);
 };
 
+// Validate and fix OHLC continuity
+const validateAndFixOHLCContinuity = (poolData) => {
+  let fixCount = 0;
+  
+  Object.entries(poolData.ohlc).forEach(([interval, candles]) => {
+    for (let i = 1; i < candles.length; i++) {
+      const prevCandle = candles[i - 1];
+      const currCandle = candles[i];
+      
+      // Check if close of previous candle equals open of current candle
+      if (prevCandle.close !== currCandle.open) {
+        console.log(`OHLC continuity issue detected in ${interval}: candle[${i-1}].close (${prevCandle.close}) != candle[${i}].open (${currCandle.open})`);
+        
+        // Fix by adjusting current candle's open to previous candle's close
+        currCandle.open = prevCandle.close;
+        fixCount++;
+      }
+    }
+  });
+  
+  if (fixCount > 0) {
+    console.log(`Fixed ${fixCount} OHLC continuity issues`);
+  }
+  
+  return fixCount;
+};
+
 // Create or load existing data file
 const initializeDataFile = async () => {
   try {
@@ -311,6 +341,14 @@ const initializeDataFile = async () => {
         }
         
         console.log(`Loaded ${Object.keys(data.pools).length} pools from file`);
+        
+        // Validate and fix OHLC continuity for all pools
+        for (const [poolAddress, poolData] of poolsData.entries()) {
+          const fixCount = validateAndFixOHLCContinuity(poolData);
+          if (fixCount > 0) {
+            console.log(`Fixed ${fixCount} continuity issues for pool ${poolAddress}`);
+          }
+        }
         
         // No default pool - priceData will be null until a pool is accessed
         priceData = null;
@@ -584,6 +622,11 @@ const cleanupOldData = (poolData) => {
 // Save price data to file
 const saveDataToFile = async () => {
   try {
+    // Validate and fix OHLC continuity before saving
+    for (const [poolAddress, poolData] of poolsData.entries()) {
+      validateAndFixOHLCContinuity(poolData);
+    }
+    
     // Save all pools data
     const allPoolsData = {};
     
@@ -635,9 +678,12 @@ const updateOHLCData = (poolData, price, timestamp) => {
       // Calculate the candle start time (rounded down to interval boundary)
       const roundedTimestamp = Math.floor(timestamp / ms) * ms;
 
+      // For continuity: new candle's open should equal previous candle's close
+      const openPrice = currentOHLC.length > 0 ? currentOHLC[currentOHLC.length - 1].close : price;
+
       currentOHLC.push({
         timestamp: roundedTimestamp,
-        open: price,
+        open: openPrice,
         high: price,
         low: price,
         close: price
