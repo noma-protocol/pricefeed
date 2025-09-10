@@ -64,7 +64,8 @@ const createPoolData = () => ({
     "30d": 0,
     total: 0,
     lastReset: Date.now()
-  }
+  },
+  volumeHistory: [] // Per-pool volume history
 });
 
 // Initialize default pool data reference (will be set after loading file)
@@ -335,11 +336,6 @@ const initializeDataFile = async () => {
           poolsData.set(poolAddress.toLowerCase(), poolData);
         }
         
-        // Load volume history
-        if (data.volumeHistory) {
-          volumeHistory.push(...data.volumeHistory);
-        }
-        
         console.log(`Loaded ${Object.keys(data.pools).length} pools from file`);
         
         // Validate and fix OHLC continuity for all pools
@@ -359,7 +355,6 @@ const initializeDataFile = async () => {
         // Create new empty data file
         const initialData = {
           pools: {},
-          volumeHistory: [],
           version: 2,
           lastSaved: Date.now()
         };
@@ -375,7 +370,6 @@ const initializeDataFile = async () => {
       // Create new file with new format
       const initialData = {
         pools: {},
-        volumeHistory: [],
         version: 2,
         lastSaved: Date.now()
       };
@@ -676,15 +670,14 @@ const saveDataToFile = async () => {
     for (const [poolAddress, poolData] of poolsData) {
       allPoolsData[poolAddress] = {
         ...poolData,
-        // Don't save volume history for now as it's global
+        // Limit volume history to last 1000 entries per pool
+        volumeHistory: (poolData.volumeHistory || []).slice(-1000)
       };
     }
     
     const dataToSave = {
       // Save pools data
       pools: allPoolsData,
-      // Save global volume history (limit to last 1000 entries)
-      volumeHistory: volumeHistory.slice(-1000),
       // Metadata
       version: 2,
       lastSaved: Date.now()
@@ -746,15 +739,12 @@ const updateOHLCData = (poolData, price, timestamp) => {
   });
 };
 
-// Track individual swaps for accurate volume calculation
-const volumeHistory = [];
-
 // Update volume tracking from actual swap events
 const updateVolume = (poolData, volumeInUSD) => {
   const now = Date.now();
   
-  // Add to volume history
-  volumeHistory.push({
+  // Add to pool-specific volume history
+  poolData.volumeHistory.push({
     volume: volumeInUSD,
     timestamp: now
   });
@@ -762,28 +752,28 @@ const updateVolume = (poolData, volumeInUSD) => {
   // Add to total volume
   poolData.volume.total += volumeInUSD;
   
-  // Calculate volume for each period based on actual history
+  // Calculate volume for each period based on pool's history
   const dayAgo = now - 24 * 60 * 60 * 1000;
   const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
   const monthAgo = now - 30 * 24 * 60 * 60 * 1000;
   
-  // Recalculate volumes based on history
-  poolData.volume["24h"] = volumeHistory
+  // Recalculate volumes based on pool's history
+  poolData.volume["24h"] = poolData.volumeHistory
     .filter(v => v.timestamp >= dayAgo)
     .reduce((sum, v) => sum + v.volume, 0);
     
-  poolData.volume["7d"] = volumeHistory
+  poolData.volume["7d"] = poolData.volumeHistory
     .filter(v => v.timestamp >= weekAgo)
     .reduce((sum, v) => sum + v.volume, 0);
     
-  poolData.volume["30d"] = volumeHistory
+  poolData.volume["30d"] = poolData.volumeHistory
     .filter(v => v.timestamp >= monthAgo)
     .reduce((sum, v) => sum + v.volume, 0);
   
   // Clean up old volume history (keep 30 days)
   const cutoffTime = monthAgo;
-  while (volumeHistory.length > 0 && volumeHistory[0].timestamp < cutoffTime) {
-    volumeHistory.shift();
+  while (poolData.volumeHistory.length > 0 && poolData.volumeHistory[0].timestamp < cutoffTime) {
+    poolData.volumeHistory.shift();
   }
 };
 
