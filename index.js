@@ -333,6 +333,10 @@ const initializeDataFile = async () => {
       if (data.pools) {
         // Load all pools data (normalize addresses to lowercase)
         for (const [poolAddress, poolData] of Object.entries(data.pools)) {
+          // Ensure volumeHistory exists for legacy pools
+          if (!poolData.volumeHistory) {
+            poolData.volumeHistory = [];
+          }
           poolsData.set(poolAddress.toLowerCase(), poolData);
         }
         
@@ -742,6 +746,11 @@ const updateOHLCData = (poolData, price, timestamp) => {
 // Update volume tracking from actual swap events
 const updateVolume = (poolData, volumeInUSD) => {
   const now = Date.now();
+  
+  // Initialize volumeHistory if it doesn't exist (for legacy pools)
+  if (!poolData.volumeHistory) {
+    poolData.volumeHistory = [];
+  }
   
   // Add to pool-specific volume history
   poolData.volumeHistory.push({
