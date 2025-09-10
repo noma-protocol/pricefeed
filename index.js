@@ -440,8 +440,13 @@ const queryPastEvents = async (poolAddress) => {
     
     console.log(`Querying events from block ${lastProcessedBlock + 1} to ${currentBlock}`);
     
-    // Create event filter for Swap events
-    const filter = poolContract.filters.Swap();
+    // Try both standard and extended V3 Swap event signatures
+    const eventSignatures = [
+      'Swap(address,address,int256,int256,uint160,uint128,int24)', // Standard V3
+      'Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)' // Extended V3 (PancakeSwap)
+    ];
+    
+    let allEvents = [];
     
     // Query events in chunks to avoid timeouts
     const blockRange = currentBlock - lastProcessedBlock;
@@ -451,23 +456,52 @@ const queryPastEvents = async (poolAddress) => {
       const fromBlock = i;
       const toBlock = Math.min(i + chunkSize - 1, currentBlock);
       
-      try {
-        const events = await poolContract.queryFilter(filter, fromBlock, toBlock);
-        
-        for (const event of events) {
-          const { sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick } = event.args;
+      // Try each event signature
+      for (const eventSig of eventSignatures) {
+        try {
+          const filter = {
+            address: poolAddress,
+            topics: [ethers.id(eventSig)],
+            fromBlock: fromBlock,
+            toBlock: toBlock
+          };
           
-          // Get pool data for this pool
-          const poolData = getPoolData(poolAddress);
-          
-          // Calculate volume (assuming token1 is USD - you'd need to verify this)
-          const volumeUSD = calculateSwapVolume(amount0, amount1, false);
-          updateVolume(poolData, volumeUSD);
-          
-          console.log(`Pool ${poolAddress}: Processed swap event: Volume $${volumeUSD.toFixed(2)}`);
+          const logs = await provider.getLogs(filter);
+          if (logs.length > 0) {
+            console.log(`Found ${logs.length} swap events with signature: ${eventSig}`);
+            allEvents = allEvents.concat(logs);
+          }
+        } catch (err) {
+          // Silently continue - some pools may not have extended events
         }
+      }
+    }
+    
+    // Process all found events
+    for (const log of allEvents) {
+      try {
+        // Manually parse the swap event
+        const sender = '0x' + log.topics[1].slice(26);
+        const recipient = '0x' + log.topics[2].slice(26);
+        
+        // Decode the data - handle both standard and extended formats
+        const dataTypes = log.data.length > 450 
+          ? ['int256', 'int256', 'uint160', 'uint128', 'int24', 'uint128', 'uint128'] // Extended
+          : ['int256', 'int256', 'uint160', 'uint128', 'int24']; // Standard
+          
+        const decoded = ethers.AbiCoder.defaultAbiCoder().decode(dataTypes, log.data);
+        const [amount0, amount1, sqrtPriceX96, liquidity, tick] = decoded;
+          
+        // Get pool data for this pool
+        const poolData = getPoolData(poolAddress);
+        
+        // Calculate volume (assuming token1 is USD - you'd need to verify this)
+        const volumeUSD = calculateSwapVolume(amount0, amount1, false);
+        updateVolume(poolData, volumeUSD);
+        
+        console.log(`Pool ${poolAddress}: Processed swap event: Volume $${volumeUSD.toFixed(2)}`);
       } catch (error) {
-        console.error(`Error querying events for blocks ${fromBlock}-${toBlock}:`, error.message);
+        console.error('Error processing swap event:', error.message);
       }
     }
     
@@ -499,9 +533,18 @@ const setupEventListenersForPool = async (poolAddress) => {
         // Store WebSocket contract for this pool
         wsPoolContracts.set(poolAddress.toLowerCase(), wsPoolContract);
         
-        // Listen to Swap events
-        wsPoolContract.on("Swap", (sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick, event) => {
+        // Listen to Swap events (handle both standard and extended formats)
+        wsPoolContract.on("Swap", (...args) => {
           console.log("Swap event detected!");
+          
+          // Extract arguments based on length (7 for standard, 9 for extended)
+          let sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick;
+          if (args.length === 8) { // Standard V3 (7 params + event object)
+            [sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick] = args;
+          } else if (args.length === 10) { // Extended V3 with protocol fees (9 params + event object)
+            [sender, recipient, amount0, amount1, sqrtPriceX96, liquidity, tick] = args;
+            // Ignore protocol fee params
+          }
           
           // Get pool data
           const poolData = getPoolData(poolAddress);
